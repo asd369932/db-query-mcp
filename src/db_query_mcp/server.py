@@ -247,11 +247,14 @@ def _to_jsonable(value: Any) -> Any:
 def _open_readonly(db_file: Path) -> sqlite3.Connection:
     """以只读方式打开数据库。三层保障:
 
-    1. URI 转义 —— 文件名里的 # ? & 不会被当 URI 元字符,?mode=ro 不会被吞;
-    2. mode=ro —— 数据库层只读;
-    3. PRAGMA query_only —— 连接级只读开关。实测:mode=ro 单独拦不住
-       `PRAGMA journal_mode=WAL`(会把库文件改成 WAL 模式),加上
-       query_only 才能把 PRAGMA 类写操作也拒掉。
+    1. URI 转义 —— 文件名里的 # ? & 不会被当 URI 元字符,?mode=ro 不会被吞
+       (不转义时 '#frag' 后的 ?mode=ro 被当 fragment 丢弃,连接静默变读写);
+    2. mode=ro —— 数据库层只读。实测能拦 journal_mode=WAL、user_version、
+       INSERT 等所有写路径(每写尝试报 "attempt to write a readonly database");
+    3. PRAGMA query_only —— 连接级兜底。注意它单独【拦不住 journal_mode=WAL】
+       (会把文件真实切到 WAL,属 SQLite 该 pragma 的特殊行为),但能拦住
+       user_version/INSERT 类;两层叠加后所有写路径均被拒。
+       (这几条都是逐层隔离实测的结论,实验脚本见 tests 里的回归用例。)
     """
     con = sqlite3.connect(_readonly_uri(db_file), uri=True, timeout=10)
     con.execute("PRAGMA query_only=ON")

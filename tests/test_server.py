@@ -298,7 +298,15 @@ class TestSecurityRegressions:
         con.close()
 
     def test_query_only_blocks_write_attempts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """连接级 query_only 兜底:即使校验层被绕过,连接也拒绝写。"""
+        """连接层兜底:绕过 SQL 校验层直接拿连接,写操作也必须被拒。
+
+        直接调用 _open_readonly()(绕过 _validate_sql),模拟"校验层被
+        未知手法绕过"的场景。每个写操作使用【全新连接】——与真实调用
+        一致(_run_query 每次新建连接后立即执行一条语句)。
+        """
+        import json
+        from db_query_mcp.server import _open_readonly
+
         monkeypatch.setenv("DB_QUERY_MCP_ROOT", str(tmp_path))
         p = tmp_path / "y.db"
         con = sqlite3.connect(p)
@@ -308,6 +316,75 @@ class TestSecurityRegressions:
         con.close()
 
         # 正常读仍工作
-        import json
         out = json.loads(query(str(p), "SELECT x FROM t"))
         assert out["rows"] == [[1]]
+
+        # 每个写操作:新连接(与 _run_query 行为一致)→ 全部必须被拒
+        write_stmts = [
+            "INSERT INTO t VALUES (99)",
+            "UPDATE t SET x = 99",
+            "DELETE FROM t",
+            "CREATE TABLE evil (y)",
+            "DROP TABLE t",
+            "PRAGMA user_version=777",
+            "PRAGMA journal_mode=WAL",
+        ]
+        for stmt in write_stmts:
+            con = _open_readonly(p)
+            try:
+                with pytest.raises(sqlite3.Error) as exc_info:
+                    con.execute(stmt)
+                assert "readonly" in str(exc_info.value).lower(), \
+                    f"{stmt} 未被连接层拒绝: {exc_info.value}"
+            finally:
+                con.close()
+
+        # 数据与库文件状态完全没变
+        con = sqlite3.connect(p)
+        assert con.execute("SELECT count(*) FROM t").fetchone()[0] == 1
+        assert con.execute("SELECT x FROM t").fetchone()[0] == 1
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert con.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert con.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name='evil'"
+        ).fetchone()[0] == 0
+        con.close()
+
+    def test_each_layer_isolation(self, tmp_path: Path) -> None:
+        """逐层隔离:记录每层能拦什么(防止文档再次写反)。
+
+        严格实验(每用例全新库)结论:
+        - mode=ro  单独:拦 journal_mode=WAL / user_version / INSERT
+        - query_only 单独:【拦不住 journal_mode=WAL】(文件真变 WAL),
+          但能拦 user_version / INSERT
+        - 两层叠加(实现):全部拦截
+        """
+        from urllib.parse import quote
+
+        def fresh_db(tag: str) -> Path:
+            p = tmp_path / f"{tag}.db"
+            c = sqlite3.connect(p)
+            c.execute("CREATE TABLE t (x)")
+            c.execute("INSERT INTO t VALUES (1)")
+            c.commit()
+            c.close()
+            return p
+
+        # mode=ro 单独:三条全拦
+        p = fresh_db("ro")
+        c = sqlite3.connect(f"file:{quote(p.as_posix())}?mode=ro", uri=True)
+        for stmt in ("PRAGMA journal_mode=WAL", "PRAGMA user_version=99", "INSERT INTO t VALUES (2)"):
+            with pytest.raises(sqlite3.Error):
+                c.execute(stmt)
+        c.close()
+
+        # query_only 单独:journal_mode=WAL 拦不住(这正是要两层的原因)
+        p2 = fresh_db("qo")
+        c = sqlite3.connect(p2)
+        c.execute("PRAGMA query_only=ON")
+        c.execute("PRAGMA journal_mode=WAL")     # 不抛错 —— SQLite 特性
+        c.close()
+        check = sqlite3.connect(p2)
+        assert check.execute("PRAGMA journal_mode").fetchone()[0] == "wal", \
+            "SQLite 行为变了?query_only 居然拦住了 journal_mode=WAL"
+        check.close()
