@@ -16,7 +16,7 @@
 
 | 边界 | 实现 | 绕过尝试的结果 |
 |------|------|----------------|
-| 只读 | ① SQL 白名单前缀(SELECT/WITH/PRAGMA/EXPLAIN)② 写操作关键字黑名单(先剥注释,防 `DEL/**/ETE` 混淆)③ PRAGMA 白名单 + 拒绝赋值 ④ 路径 URI 转义 + `mode=ro` ⑤ `PRAGMA query_only=ON` | 拒绝并返回原因,不执行 |
+| 只读 | ① SQL 白名单前缀(SELECT/WITH/PRAGMA/EXPLAIN)② 写操作关键字黑名单(引号感知剥注释,防 `DEL/**/ETE` 混淆,且不会误伤字符串)③ PRAGMA 白名单 + 拒绝赋值/括号传参 ④ 路径 URI 转义 + `mode=ro` ⑤ `PRAGMA query_only=ON` | 拒绝并返回原因,不执行 |
 | 结果封顶 | 硬上限 500 行 + 单元格超 2000 字符截断 | 返回 `truncated: true` |
 | 路径限制 | 库文件必须位于 `DB_QUERY_MCP_ROOT`(默认当前目录)内 | 拒绝并列出允许目录 |
 
@@ -27,9 +27,16 @@
   必须 `quote()` 转义路径。
 - **PRAGMA 写**:`mode=ro` 单独拦不住 `PRAGMA journal_mode=WAL`(会真实
   改写库文件头)。`query_only` 连接级开关才能把 PRAGMA 类写操作也拒掉。
-- **注释混淆**:`DEL/**/ETE` 在 SQLite 里等于 `DELETE`,校验前必须先剥注释。
+- **括号传参绕过**:`PRAGMA user_version(123)` 是 SQLite 的合法语法,
+  但等号检查拦不住它。只有"名字参数"类 pragma(table_info 等)才允许
+  带括号。
+- **注释混淆与字符串误伤**:`DEL/**/ETE` 在 SQLite 里等于 `DELETE`,
+  校验前必须剥注释;但剥注释必须引号感知 —— 字符串里的 `'--x--'`
+  不是注释,正则直接剥会破坏合法查询。实现用双视图扫描:
+  执行用 cleaned(注释删、字符串留),校验用 code_only(字符串遮蔽,
+  数据里的 `DELETE`/`;` 不会误判)。
 
-这三点都是先被实际绕过、修复后才写进这段文档的(见 git 历史里的
+这些点都是先被实际绕过、修复后才写进这段文档的(见 git 历史里的
 `fix(security)` 提交和 `TestSecurityRegressions` 回归测试)。
 
 ## 安装
