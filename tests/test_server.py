@@ -69,6 +69,36 @@ class TestSqlValidation:
         with pytest.raises(QueryError, match="只读"):
             _validate_sql("PRAGMA writable_schema=ON")
 
+    def test_pragma_assignment_rejected(self) -> None:
+        # 赋值型 PRAGMA 全部按写操作拦截(实测 journal_mode=WAL 能真实改库)
+        with pytest.raises(QueryError, match="赋值"):
+            _validate_sql("PRAGMA journal_mode=WAL")
+        with pytest.raises(QueryError, match="赋值"):
+            _validate_sql("PRAGMA user_version=123")
+
+    def test_readonly_pragma_ok(self) -> None:
+        _validate_sql("PRAGMA table_info(users)")
+        _validate_sql("PRAGMA index_list(users)")
+
+    def test_nonwhitelisted_pragma_rejected(self) -> None:
+        with pytest.raises(QueryError, match="白名单"):
+            _validate_sql("PRAGMA journal_mode")
+
+    def test_comment_obfuscation_rejected(self) -> None:
+        # 注释拆分的写操作关键字必须被识别:DEL/**/ETE 在 SQLite 里等于 DELETE,
+        # 不删注释就躲过黑名单。拒绝理由可能是"分号"或"关键字",重点是【不放行】。
+        with pytest.raises(QueryError):
+            _validate_sql("SELECT 1; DEL/**/ETE FROM t")
+        # 纯注释混淆(Pragma 名):删注释后命中黑名单的 writable_schema
+        with pytest.raises(QueryError, match="只读"):
+            _validate_sql("PRAGMA writ/**/able_schema=ON")
+        # 注释里的关键字(不在语句里)不该误伤
+        _validate_sql("SELECT 1 /* delete this comment */")
+
+    def test_line_comment_removed(self) -> None:
+        # 行注释里有关键字不影响;注释外没有就放行
+        _validate_sql("SELECT 1 -- delete from nowhere\n")
+
     def test_column_named_like_keyword_ok(self) -> None:
         # update_time / created_at 这类列名不能被词边界误杀
         _validate_sql("SELECT update_time, created_at, deleted_flag FROM t")
@@ -150,3 +180,67 @@ class TestQueryExecution:
         con.close()
         out = json.loads(query(str(p), "SELECT data FROM blobs"))
         assert out["rows"][0][0] == "<blob 4 bytes>"
+
+
+class TestSecurityRegressions:
+    """回归测试:验证 verify 子代理发现的三个绕过均已修复。
+
+    这些不是理论问题,都是实际利用成功的:
+    - URI fragment: 文件名含 # 时 ?mode=ro 被丢弃 → 实际读写模式打开
+    - PRAGMA 写:     journal_mode/user_version 能真实改动库文件
+    """
+
+    def test_uri_fragment_cannot_escalate_to_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """文件名含 # 时,不能通过 URI 解析把只读连接变成读写连接。"""
+        monkeypatch.setenv("DB_QUERY_MCP_ROOT", str(tmp_path))
+        real = tmp_path / "evil.db"
+        con = sqlite3.connect(real)
+        con.execute("CREATE TABLE accounts (data TEXT)")
+        con.execute("INSERT INTO accounts VALUES ('secret')")
+        con.execute("PRAGMA user_version=0")
+        con.commit()
+        con.close()
+        # 诱饵文件:名字里带 #(旧实现下会让 evil.db 被读写模式打开)
+        (tmp_path / "evil.db#frag").write_text("not a database")
+
+        # 通过诱饵路径请求 → 要么报错(打开的是诱饵),要么拒绝;绝不能读到真库
+        out = query(str(tmp_path / "evil.db#frag"), "SELECT * FROM accounts")
+        assert "secret" not in out, f"越权读到了真库内容: {out[:200]}"
+
+    def test_pragma_write_cannot_modify_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PRAGMA 写操作必须被拒绝,且库文件真实状态不变。"""
+        monkeypatch.setenv("DB_QUERY_MCP_ROOT", str(tmp_path))
+        p = tmp_path / "x.db"
+        con = sqlite3.connect(p)
+        con.execute("CREATE TABLE t (x)")
+        con.commit()
+        con.close()
+
+        assert query(str(p), "PRAGMA user_version=123").startswith("[拒绝]")
+        assert query(str(p), "PRAGMA journal_mode=WAL").startswith("[拒绝]")
+        assert query(str(p), "PRAGMA writable_schema=ON").startswith("[拒绝]")
+
+        # 检查文件真实状态未被改动
+        con = sqlite3.connect(p)
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 0
+        assert con.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        con.close()
+
+    def test_query_only_blocks_write_attempts(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """连接级 query_only 兜底:即使校验层被绕过,连接也拒绝写。"""
+        monkeypatch.setenv("DB_QUERY_MCP_ROOT", str(tmp_path))
+        p = tmp_path / "y.db"
+        con = sqlite3.connect(p)
+        con.execute("CREATE TABLE t (x INTEGER)")
+        con.execute("INSERT INTO t VALUES (1)")
+        con.commit()
+        con.close()
+
+        # 正常读仍工作
+        import json
+        out = json.loads(query(str(p), "SELECT x FROM t"))
+        assert out["rows"] == [[1]]

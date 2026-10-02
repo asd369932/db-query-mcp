@@ -18,6 +18,7 @@ import re
 import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from mcp.server.mcpserver import MCPServer
 
@@ -52,6 +53,33 @@ _FORBIDDEN = re.compile(
     re.IGNORECASE,
 )
 
+# PRAGMA 白名单:只放行纯读取的。写类(如 journal_mode=WAL、user_version=123)
+# 不在名单里,直接拒绝 —— 它们能真实改动库文件。
+_READONLY_PRAGMAS = {
+    "table_info",
+    "table_list",
+    "table_xinfo",
+    "index_info",
+    "index_list",
+    "index_xinfo",
+    "foreign_key_list",
+    "database_list",
+    "collation_list",
+    "compile_options",
+    "function_list",
+    "pragma_list",
+    "module_list",
+    "integrity_check",
+    "quick_check",
+    "user_version",   # 读取版本号;带 = 赋值会被 SQL 校验的引号/赋值检测另行拦截
+    "schema_version",
+    "page_count",
+    "page_size",
+    "encoding",
+    "freelist_count",
+    "application_id",
+}
+
 # 允许的库根目录:环境变量 DB_QUERY_MCP_ROOT 覆盖,默认当前工作目录
 def _allowed_roots() -> list[Path]:
     roots = []
@@ -62,6 +90,13 @@ def _allowed_roots() -> list[Path]:
     if not roots:
         roots.append(Path.cwd().resolve())
     return roots
+
+
+# SQLite 的 URI 文件名有保留字符(& ? # % 等)。不转义时,文件名里的 '#frag'
+# 会被解析成 URI fragment,把后半段(含 ?mode=ro)整段丢弃 —— 连接于是以默认
+# 读写模式打开,只读防线静默失效。所有拼 URI 的地方必须走这个函数。
+def _readonly_uri(db_file: Path) -> str:
+    return f"file:{quote(db_file.as_posix())}?mode=ro"
 
 
 class QueryError(Exception):
@@ -89,8 +124,14 @@ def _resolve_db_path(db_path: str) -> Path:
 
 
 def _validate_sql(sql: str) -> str:
-    """把 SQL 收紧到"单条只读查询"。返回去掉首尾空白后的语句。"""
-    s = sql.strip().rstrip(";").strip()
+    """把 SQL 收紧到"单条只读查询"。返回去掉首尾空白后的语句。
+
+    校验前先删掉注释 —— 否则 `INS/**/ERT` 这类写法能躲过关键字黑名单
+    (SQLite 把块注释当空白,拼接后仍是完整关键字)。
+    """
+    s = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)  # 块注释
+    s = re.sub(r"--[^\n]*", "", s)                        # 行注释
+    s = s.strip().rstrip(";").strip()
     if not s:
         raise QueryError("SQL 为空")
 
@@ -105,6 +146,20 @@ def _validate_sql(sql: str) -> str:
     hit = _FORBIDDEN.search(s)
     if hit:
         raise QueryError(f"检测到写操作关键字: {hit.group(0).upper()}(本服务只读)")
+
+    # PRAGMA 校验两条:
+    # 1. 带赋值(=)的一律拒绝 —— 赋值型 PRAGMA 全是写操作(user_version=123、
+    #    journal_mode=WAL、writable_schema=ON 都算),没有例外;
+    # 2. 无赋值的也要在只读白名单内 —— 挡住那些不带 = 但同样改库的 pragma。
+    if s.upper().startswith("PRAGMA"):
+        if "=" in s:
+            raise QueryError("PRAGMA 赋值属于写操作,本服务只读")
+        pragma_name = re.sub(r"^PRAGMA\s+(\w+).*$", r"\1", s, flags=re.IGNORECASE | re.DOTALL)
+        if pragma_name.lower() not in _READONLY_PRAGMAS:
+            raise QueryError(
+                f"PRAGMA {pragma_name} 未在只读白名单内。"
+                f"允许的: {', '.join(sorted(_READONLY_PRAGMAS))}"
+            )
     return s
 
 
@@ -118,10 +173,22 @@ def _to_jsonable(value: Any) -> Any:
     return value
 
 
+def _open_readonly(db_file: Path) -> sqlite3.Connection:
+    """以只读方式打开数据库。三层保障:
+
+    1. URI 转义 —— 文件名里的 # ? & 不会被当 URI 元字符,?mode=ro 不会被吞;
+    2. mode=ro —— 数据库层只读;
+    3. PRAGMA query_only —— 连接级只读开关。实测:mode=ro 单独拦不住
+       `PRAGMA journal_mode=WAL`(会把库文件改成 WAL 模式),加上
+       query_only 才能把 PRAGMA 类写操作也拒掉。
+    """
+    con = sqlite3.connect(_readonly_uri(db_file), uri=True, timeout=10)
+    con.execute("PRAGMA query_only=ON")
+    return con
+
+
 def _run_query(db_file: Path, sql: str, max_rows: int) -> dict[str, Any]:
-    # ro URI:即使 SQL 漏过校验,数据库层也是只读的(双保险)
-    uri = f"file:{db_file.as_posix()}?mode=ro"
-    con = sqlite3.connect(uri, uri=True, timeout=10)
+    con = _open_readonly(db_file)
     try:
         con.row_factory = sqlite3.Row
         cur = con.execute(sql)
@@ -173,8 +240,9 @@ def schema(db_path: str, table: str = "") -> str:
     except QueryError as e:
         return f"[拒绝] {e}"
 
-    uri = f"file:{db_file.as_posix()}?mode=ro"
+    uri = _readonly_uri(db_file)
     con = sqlite3.connect(uri, uri=True, timeout=10)
+    con.execute("PRAGMA query_only=ON")
     try:
         con.row_factory = sqlite3.Row
         if not table:
@@ -190,7 +258,7 @@ def schema(db_path: str, table: str = "") -> str:
         if cur.fetchone() is None:
             return f"[未找到] 表/视图不存在: {table}"
 
-        info = con.execute(f'PRAGMA table_info("{table}")').fetchall()
+        info = con.execute('PRAGMA table_info("' + table.replace('"', '""') + '")').fetchall()
         columns = [
             {
                 "name": r["name"],
