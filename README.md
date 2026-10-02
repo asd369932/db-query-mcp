@@ -20,13 +20,21 @@
 | 结果封顶 | 硬上限 500 行 + 单元格超 2000 字符截断 | 返回 `truncated: true` |
 | 路径限制 | 库文件必须位于 `DB_QUERY_MCP_ROOT`(默认当前目录)内 | 拒绝并列出允许目录 |
 
-只读为什么需要这么多层 —— 对抗性测试中的真实教训:
+只读为什么需要这么多层 —— 对抗性测试与逐层隔离实验的真实教训:
 
 - **URI 注入**:不转义直接拼 `f"file:{path}?mode=ro"` 时,文件名里的 `#`
   会被解析成 fragment,把 `?mode=ro` 整段丢弃 → 连接偷偷变成读写模式。
   必须 `quote()` 转义路径。
-- **PRAGMA 写**:`mode=ro` 单独拦不住 `PRAGMA journal_mode=WAL`(会真实
-  改写库文件头)。`query_only` 连接级开关才能把 PRAGMA 类写操作也拒掉。
+- **两层各能拦什么(逐层隔离实测,每用例全新库)**:
+
+  | 连接配置 | journal_mode=WAL | user_version 写 | INSERT |
+  |----------|------------------|-----------------|--------|
+  | 仅 `mode=ro` | 拦 | 拦 | 拦 |
+  | 仅 `query_only` | **拦不住**(文件真变 WAL) | 拦 | 拦 |
+  | 两层叠加(本实现) | 拦 | 拦 | 拦 |
+
+  `query_only` 单独拦不住 `journal_mode=WAL` 是 SQLite 的 pragma 特性,
+  这正是两层都留的原因;行为由 `test_each_layer_isolation` 钉住。
 - **括号传参绕过**:`PRAGMA user_version(123)` 是 SQLite 的合法语法,
   但等号检查拦不住它。只有"名字参数"类 pragma(table_info 等)才允许
   带括号。
