@@ -53,16 +53,18 @@ _FORBIDDEN = re.compile(
     re.IGNORECASE,
 )
 
-# PRAGMA 白名单:只放行纯读取的。写类(如 journal_mode=WAL、user_version=123)
-# 不在名单里,直接拒绝 —— 它们能真实改动库文件。
+# PRAGMA 白名单分两类:
+# - 无参数读取型:出现等号/括号一律拒绝
+# - 名字参数型:允许 `name(表名)` 形式(如 table_info(users));这些 pragma
+#   的参数语义是"对象名查找",不是赋值,无法借此写库
 _READONLY_PRAGMAS = {
-    "table_info",
-    "table_list",
-    "table_xinfo",
-    "index_info",
-    "index_list",
-    "index_xinfo",
-    "foreign_key_list",
+    "user_version",   # 只放行无参读取;= 与 () 形式都会被赋值/参数检查拦下
+    "schema_version",
+    "page_count",
+    "page_size",
+    "encoding",
+    "freelist_count",
+    "application_id",
     "database_list",
     "collation_list",
     "compile_options",
@@ -71,13 +73,16 @@ _READONLY_PRAGMAS = {
     "module_list",
     "integrity_check",
     "quick_check",
-    "user_version",   # 读取版本号;带 = 赋值会被 SQL 校验的引号/赋值检测另行拦截
-    "schema_version",
-    "page_count",
-    "page_size",
-    "encoding",
-    "freelist_count",
-    "application_id",
+}
+
+_NAME_ARG_PRAGMAS = {
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_info",
+    "index_list",
+    "index_xinfo",
+    "foreign_key_list",
 }
 
 # 允许的库根目录:环境变量 DB_QUERY_MCP_ROOT 覆盖,默认当前工作目录
@@ -123,44 +128,110 @@ def _resolve_db_path(db_path: str) -> Path:
     return p
 
 
-def _validate_sql(sql: str) -> str:
-    """把 SQL 收紧到"单条只读查询"。返回去掉首尾空白后的语句。
+def _scan_sql(sql: str) -> tuple[str, str]:
+    """扫描 SQL,返回 (cleaned, code_only)。
 
-    校验前先删掉注释 —— 否则 `INS/**/ERT` 这类写法能躲过关键字黑名单
-    (SQLite 把块注释当空白,拼接后仍是完整关键字)。
+    cleaned   —— 删注释、保留字符串字面量;交给 SQLite 执行。
+    code_only —— 删注释、并把字符串内容遮蔽;给关键字/分号/PRAGMA 检查用。
+
+    两个必须点:
+    1. 注释删除必须引号感知 —— 字符串里的 '--' 或 '/*' 不是注释。
+       正则直接剥会破坏合法查询(`WHERE msg='--x--'` 变语法错误,
+       `'/* x */'` 被剥后语义静默改变)。
+    2. 校验要用 code_only —— 否则字符串内容里的 'DELETE' 或 ';'
+       会把合法查询误判成写操作/多语句(`WHERE action='DELETE'`)。
+       字符串是数据,永远不可执行,遮蔽它们不会放过真攻击。
     """
-    s = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)  # 块注释
-    s = re.sub(r"--[^\n]*", "", s)                        # 行注释
-    s = s.strip().rstrip(";").strip()
-    if not s:
+    cleaned: list[str] = []
+    code: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in ("'", '"', "`"):
+            # 引号段:双写引号是转义,不算结束
+            j = i + 1
+            while j < n:
+                if sql[j] == ch:
+                    if j + 1 < n and sql[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            end = min(j + 1, n)
+            cleaned.append(sql[i:end])
+            code.append(ch * 2)          # 空字面量占位
+            i = end
+        elif ch == "[":
+            j = sql.find("]", i + 1)
+            end = n if j == -1 else j + 1
+            cleaned.append(sql[i:end])
+            code.append("[]")
+            i = end
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            cleaned.append(" ")
+            code.append(" ")
+            i = n if j == -1 else j + 2
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i + 2)
+            cleaned.append(" ")
+            code.append(" ")
+            i = n if j == -1 else j
+        else:
+            cleaned.append(ch)
+            code.append(ch)
+            i += 1
+    return "".join(cleaned), "".join(code)
+
+
+def _validate_sql(sql: str) -> str:
+    """把 SQL 收紧到"单条只读查询"。返回清洗后的语句(供执行)。
+
+    所有检查跑在 code_only 上(注释已删、字符串内容已遮蔽);
+    返回的则是 cleaned(字符串完整保留)。
+    """
+    cleaned, code = _scan_sql(sql)
+    code = code.strip().rstrip(";").strip()
+    if not code:
         raise QueryError("SQL 为空")
 
     # 拒绝多语句(分号后还有非空内容)
-    body = s[:-1] if s.endswith(";") else s
+    body = code[:-1] if code.endswith(";") else code
     if ";" in body:
         raise QueryError("只允许单条语句,检测到多个分号")
 
-    if not _ALLOWED_LEADING.match(s):
+    if not _ALLOWED_LEADING.match(code):
         raise QueryError("只允许 SELECT / WITH / PRAGMA / EXPLAIN 开头的只读查询")
 
-    hit = _FORBIDDEN.search(s)
+    hit = _FORBIDDEN.search(code)
     if hit:
         raise QueryError(f"检测到写操作关键字: {hit.group(0).upper()}(本服务只读)")
 
-    # PRAGMA 校验两条:
-    # 1. 带赋值(=)的一律拒绝 —— 赋值型 PRAGMA 全是写操作(user_version=123、
-    #    journal_mode=WAL、writable_schema=ON 都算),没有例外;
-    # 2. 无赋值的也要在只读白名单内 —— 挡住那些不带 = 但同样改库的 pragma。
-    if s.upper().startswith("PRAGMA"):
-        if "=" in s:
+    # PRAGMA 校验三条(三种写形式全部要堵):
+    # 1. 等号赋值 `PRAGMA name=value` → 拒绝
+    # 2. 括号传值 `PRAGMA name(value)` → 只有"名字参数"类 pragma
+    #    才允许(如 table_info(表名));其余带括号一律拒绝
+    #    (实测 PRAGMA user_version(123) 会触发写,但等号检查拦不住它)
+    # 3. "名字参数"类 pragma 的参数里不能有等号(防混入赋值)
+    if code.upper().startswith("PRAGMA"):
+        m = re.match(r"^PRAGMA\s+(\w+)\s*(.*)$", code, re.IGNORECASE | re.DOTALL)
+        if not m:
+            raise QueryError("PRAGMA 语法无法解析")
+        pragma_name, rest = m.group(1).lower(), m.group(2).strip()
+
+        if rest.startswith("="):
             raise QueryError("PRAGMA 赋值属于写操作,本服务只读")
-        pragma_name = re.sub(r"^PRAGMA\s+(\w+).*$", r"\1", s, flags=re.IGNORECASE | re.DOTALL)
-        if pragma_name.lower() not in _READONLY_PRAGMAS:
-            raise QueryError(
-                f"PRAGMA {pragma_name} 未在只读白名单内。"
-                f"允许的: {', '.join(sorted(_READONLY_PRAGMAS))}"
-            )
-    return s
+        if rest.startswith("("):
+            if pragma_name not in _NAME_ARG_PRAGMAS:
+                raise QueryError(
+                    f"PRAGMA {pragma_name} 不接受参数(带参数形式可能触发写操作),本服务只读"
+                )
+            if "=" in rest:
+                raise QueryError("PRAGMA 参数含赋值,拒绝")
+        if pragma_name not in _READONLY_PRAGMAS and pragma_name not in _NAME_ARG_PRAGMAS:
+            allowed = ", ".join(sorted(_READONLY_PRAGMAS | _NAME_ARG_PRAGMAS))
+            raise QueryError(f"PRAGMA {pragma_name} 未在只读白名单内。允许的: {allowed}")
+    return cleaned.strip().rstrip(";").strip()
 
 
 def _to_jsonable(value: Any) -> Any:

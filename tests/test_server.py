@@ -99,6 +99,34 @@ class TestSqlValidation:
         # 行注释里有关键字不影响;注释外没有就放行
         _validate_sql("SELECT 1 -- delete from nowhere\n")
 
+    def test_string_literal_with_comment_markers_preserved(self) -> None:
+        # 字符串里的 -- 和 /* */ 不是注释,不能被剥(复审发现的回归)
+        out = _validate_sql("SELECT msg FROM t WHERE msg = '--hello--'")
+        assert "'--hello--'" in out
+        out2 = _validate_sql("SELECT msg FROM t WHERE msg = '/* not comment */'")
+        assert "'/* not comment */'" in out2
+
+    def test_string_literal_with_keyword_not_rejected(self) -> None:
+        # 字符串内容里的写操作关键字是数据不是语句,不能误杀
+        _validate_sql("SELECT * FROM logs WHERE action = 'DELETE'")
+        _validate_sql("SELECT * FROM logs WHERE note = 'DROP TABLE'")
+
+    def test_string_literal_semicolon_not_multi_statement(self) -> None:
+        # 字符串里的分号不算多语句
+        _validate_sql("SELECT * FROM t WHERE msg = 'a;b'")
+
+    def test_pragma_paren_argument_bypass_rejected(self) -> None:
+        # 复审发现:PRAGMA user_version(123) 括号写法绕过等号检查
+        with pytest.raises(QueryError, match="参数"):
+            _validate_sql("PRAGMA user_version(123)")
+        with pytest.raises(QueryError, match="参数"):
+            _validate_sql("PRAGMA page_size(8192)")
+
+    def test_pragma_name_arg_still_allowed(self) -> None:
+        # table_info(表名) 是合法只读用法,不能误杀
+        _validate_sql("PRAGMA table_info(users)")
+        _validate_sql("PRAGMA index_list(users)")
+
     def test_column_named_like_keyword_ok(self) -> None:
         # update_time / created_at 这类列名不能被词边界误杀
         _validate_sql("SELECT update_time, created_at, deleted_flag FROM t")
@@ -208,6 +236,45 @@ class TestSecurityRegressions:
         # 通过诱饵路径请求 → 要么报错(打开的是诱饵),要么拒绝;绝不能读到真库
         out = query(str(tmp_path / "evil.db#frag"), "SELECT * FROM accounts")
         assert "secret" not in out, f"越权读到了真库内容: {out[:200]}"
+
+    def test_string_containing_sql_keywords_queries_fine(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """字符串里带 SQL 关键字/注释符的数据能正常查询(复审发现的回归)。"""
+        import json
+        monkeypatch.setenv("DB_QUERY_MCP_ROOT", str(tmp_path))
+        p = tmp_path / "s.db"
+        con = sqlite3.connect(p)
+        con.execute("CREATE TABLE logs (msg TEXT)")
+        con.executemany("INSERT INTO logs VALUES (?)",
+                        [("--hello--",), ("/* not comment */",), ("DELETE now",)])
+        con.commit()
+        con.close()
+
+        # 查含注释符的字符串 → 必须返回正确结果
+        out = json.loads(query(str(p), "SELECT msg FROM logs WHERE msg = '--hello--'"))
+        assert out["row_count"] == 1, f"字符串里的 -- 未被正确保留: {out}"
+        out2 = json.loads(query(str(p), "SELECT msg FROM logs WHERE msg = '/* not comment */'"))
+        assert out2["row_count"] == 1, f"字符串里的 /* */ 未被正确保留: {out2}"
+        # 查含关键字的数据 → 不能误判为写操作
+        out3 = json.loads(query(str(p), "SELECT msg FROM logs WHERE msg = 'DELETE now'"))
+        assert out3["row_count"] == 1
+
+    def test_pragma_paren_write_still_blocked(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """括号形式 PRAGMA 写(user_version(123))必须拒绝且文件不变。"""
+        monkeypatch.setenv("DB_QUERY_MCP_ROOT", str(tmp_path))
+        p = tmp_path / "pv.db"
+        con = sqlite3.connect(p)
+        con.execute("CREATE TABLE t (x)")
+        con.commit()
+        con.close()
+
+        assert query(str(p), "PRAGMA user_version(123)").startswith("[拒绝]")
+        con = sqlite3.connect(p)
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 0
+        con.close()
 
     def test_pragma_write_cannot_modify_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
