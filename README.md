@@ -16,11 +16,21 @@
 
 | 边界 | 实现 | 绕过尝试的结果 |
 |------|------|----------------|
-| 只读 | ① SQL 白名单前缀(SELECT/WITH/PRAGMA/EXPLAIN) ② 写操作关键字黑名单 ③ `mode=ro` URI 打开 | 拒绝并返回原因,不执行 |
+| 只读 | ① SQL 白名单前缀(SELECT/WITH/PRAGMA/EXPLAIN)② 写操作关键字黑名单(先剥注释,防 `DEL/**/ETE` 混淆)③ PRAGMA 白名单 + 拒绝赋值 ④ 路径 URI 转义 + `mode=ro` ⑤ `PRAGMA query_only=ON` | 拒绝并返回原因,不执行 |
 | 结果封顶 | 硬上限 500 行 + 单元格超 2000 字符截断 | 返回 `truncated: true` |
 | 路径限制 | 库文件必须位于 `DB_QUERY_MCP_ROOT`(默认当前目录)内 | 拒绝并列出允许目录 |
 
-只读是三层防御:即使某个新 SQL 方言绕过前两层,`mode=ro` 的连接层也会兜底。
+只读为什么需要这么多层 —— 对抗性测试中的真实教训:
+
+- **URI 注入**:不转义直接拼 `f"file:{path}?mode=ro"` 时,文件名里的 `#`
+  会被解析成 fragment,把 `?mode=ro` 整段丢弃 → 连接偷偷变成读写模式。
+  必须 `quote()` 转义路径。
+- **PRAGMA 写**:`mode=ro` 单独拦不住 `PRAGMA journal_mode=WAL`(会真实
+  改写库文件头)。`query_only` 连接级开关才能把 PRAGMA 类写操作也拒掉。
+- **注释混淆**:`DEL/**/ETE` 在 SQLite 里等于 `DELETE`,校验前必须先剥注释。
+
+这三点都是先被实际绕过、修复后才写进这段文档的(见 git 历史里的
+`fix(security)` 提交和 `TestSecurityRegressions` 回归测试)。
 
 ## 安装
 
